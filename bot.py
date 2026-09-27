@@ -1,9 +1,11 @@
+import os
 import discord
 from google import genai
 
-# ==================== 1. 設定區域 ====================
-DISCORD_BOT_TOKEN = "你的_DISCORD_BOT_TOKEN"
-GEMINI_API_KEY     = "你的_GEMINI_API_KEY"  # 剛才複製的 ...kz6w 那串
+# ==================== 1. 設定區域 (從環境變數讀取) ====================
+# 優先讀取 Railway 的環境變數，若在本地電腦執行則 fallback 讀取備用值
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
 
 # ==================== 2. 初始化 ====================
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
