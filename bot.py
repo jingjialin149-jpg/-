@@ -50,7 +50,7 @@ SYSTEM_PROMPT = """
 請一律使用標準繁體中文（台灣），語氣沉穩、條理分明、親切且簡短扼要。
 """
 
-MODELS_TO_TRY = ["gemini-2.5-flash", "gemini-1.5-flash"]
+MODELS_TO_TRY = ["gemini-3.8-flash", "gemini-3-flash-preview"]
 
 @bot.event
 async def on_ready():
