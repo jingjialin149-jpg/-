@@ -1,14 +1,14 @@
 import os
 import re
+import asyncio
 import discord
 from google import genai
 from google.genai import types
 
-# ==================== 1. 環境變數讀取 (支援單變數逗號分隔或多變數命名) ====================
-# 同時相容 DISCORD_BOT_TOKEN 或 DISCORD_TOKEN
+# ==================== 1. 環境變數讀取 (雙向相容) ====================
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
 
-# 讀取 GEMINI_API_KEY (支援用逗號分開多把 Key)
+# 讀取 GEMINI_API_KEY (支援逗號分隔)
 raw_keys_str = os.getenv("GEMINI_API_KEY", "")
 keys_list = [k.strip() for k in raw_keys_str.split(",") if k.strip()]
 
@@ -20,7 +20,6 @@ for i in range(2, 6):
 
 # 去除重複項
 API_KEYS = list(dict.fromkeys(keys_list))
-
 current_key_index = 0
 
 def get_current_client():
@@ -51,7 +50,6 @@ SYSTEM_PROMPT = """
 請一律使用標準繁體中文（台灣），語氣沉穩、條理分明、親切且簡短扼要。
 """
 
-# 依序嘗試的官方穩定模型
 MODELS_TO_TRY = ["gemini-2.5-flash", "gemini-1.5-flash"]
 
 @bot.event
@@ -61,11 +59,9 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    # 忽略機器人自身發布的訊息
     if message.author == bot.user:
         return
 
-    # 判斷是否為私訊，或是在頻道中被 tag
     if bot.user in message.mentions or isinstance(message.channel, discord.DMChannel):
         clean_text = message.clean_content.replace(f"@{bot.user.name}", "").strip()
         clean_text = re.sub(r"^<@!?\d+>\s*", "", clean_text).strip()
@@ -85,7 +81,9 @@ async def on_message(message):
                     # 嘗試可用模型
                     for model_name in MODELS_TO_TRY:
                         try:
-                            response = await ai_client.aio.models.generate_content(
+                            # 修正：使用 asyncio.to_thread 執行同步呼叫，避免阻塞 Discord 迴圈與 aio 屬性錯誤
+                            response = await asyncio.to_thread(
+                                ai_client.models.generate_content,
                                 model=model_name,
                                 contents=clean_text,
                                 config=types.GenerateContentConfig(
@@ -112,5 +110,4 @@ async def on_message(message):
             else:
                 await message.reply("抱歉，目前所有 AI 額度均暫時滿載或連線異常，請稍候片刻再試！")
 
-# 啟動機器人
 bot.run(DISCORD_TOKEN)
