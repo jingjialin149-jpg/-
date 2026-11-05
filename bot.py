@@ -1,49 +1,67 @@
 import os
-import re
 import asyncio
-import discord
+import logging
+import re
 from aiohttp import web
+import discord
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
-# ==================== 1. 環境變數讀取 (雙向相容) ====================
-# 同時支援 DISCORD_BOT_TOKEN 或 DISCORD_TOKEN
-DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
-ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0"))
-PORT = int(os.getenv("PORT", "8080"))  # Railway 會自動注入 PORT
+# ==================== 0. 載入本地 .env 環境變數 ====================
+load_dotenv()
 
-# 讀取 GEMINI_API_KEY (支援逗號分隔或多變數命名)
-raw_keys_str = os.getenv("GEMINI_API_KEY", "")
-keys_list = [k.strip() for k in raw_keys_str.split(",") if k.strip()]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-for i in range(2, 6):
-    extra_key = os.getenv(f"GEMINI_API_KEY_{i}")
-    if extra_key and extra_key.strip():
-        keys_list.append(extra_key.strip())
+# ==================== 1. 取得環境變數設定 ====================
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
 
-API_KEYS = list(dict.fromkeys(keys_list))
+raw_channel_id = os.getenv("ALERT_CHANNEL_ID", "")
+digits_only = re.sub(r"\D", "", raw_channel_id)
+ALERT_CHANNEL_ID = int(digits_only) if digits_only else None
+
+PORT = int(os.getenv("PORT", 8080))
+
+gemini_keys = []
+primary_key = os.getenv("GEMINI_API_KEY", "")
+if primary_key:
+    gemini_keys.extend([k.strip() for k in primary_key.split(",") if k.strip()])
+
+idx = 2
+while True:
+    k = os.getenv(f"GEMINI_API_KEY_{idx}")
+    if k:
+        k_clean = k.strip()
+        if k_clean and k_clean not in gemini_keys:
+            gemini_keys.append(k_clean)
+        idx += 1
+    else:
+        break
+
+if not gemini_keys:
+    logging.warning("⚠️ 未讀取到任何 GEMINI_API_KEY，AI 急救建議將自動使用靜態備援清單。")
+else:
+    logging.info(f"🔑 目前共成功載入 {len(gemini_keys)} 組 Gemini API Key 備援")
+
 current_key_index = 0
 
 def get_current_client():
-    """取得目前使用的 Gemini 客戶端"""
-    global current_key_index
-    if not API_KEYS:
-        raise ValueError("未讀取到任何有效的 GEMINI_API_KEY，請檢查環境變數！")
-    return genai.Client(api_key=API_KEYS[current_key_index])
+    if not gemini_keys:
+        return None
+    return genai.Client(api_key=gemini_keys[current_key_index])
 
 def switch_to_next_key():
-    """切換至下一組備援 Key"""
     global current_key_index
-    if len(API_KEYS) > 1:
-        current_key_index = (current_key_index + 1) % len(API_KEYS)
-        print(f"⚠️ 偵測到限制或呼叫失敗，已自動切換至第 {current_key_index + 1} 組 Key")
-        return True
-    return False
+    if not gemini_keys:
+        return
+    old_idx = current_key_index
+    current_key_index = (current_key_index + 1) % len(gemini_keys)
+    logging.warning(f"🔄 Gemini API 觸發輪替：由第 {old_idx + 1} 組切換至第 {current_key_index + 1} 組 Key")
 
-# ==================== 2. 模型與 Prompt 設定 ====================
+# ==================== 2. 安全邊界提示詞 (對齊夏普 GP2Y0A21YK0F 架構) ====================
 SYSTEM_PROMPT = """
 你現在是運行在 Discord 伺服器中的『浴室安全小幫手』。
-專題定位：搭配 ESP32 微控制器與多層 PIR 紅外線感測器，專門針對長輩進行無影像、高隱私的浴室防跌即時通報與照護輔助。
+專題定位：搭配 ESP32 微控制器與 6 組夏普 (Sharp) GP2Y0A21YK0F 紅外線測距感測器（分為上層站立偵測與下層地面防跌陣列），專門針對長輩進行無攝影機、高隱私的浴室防跌即時通報與照護輔助。
 
 ==================== 【核心醫療安全與防護邊界 (Guardrails)】 ====================
 為確保長者生命安全與避免法律責任，你必須嚴格遵守以下防護邊界：
@@ -61,113 +79,138 @@ SYSTEM_PROMPT = """
 5. 評估就醫需求：若狀況不對勁，立刻撥打 119，並指引現場人員解鎖大門、清除救護動線。
 
 ==================== 【日常對話與衛教諮詢】 ====================
-平時若家屬在頻道中詢問長照、浴室防滑、安全扶手等日常防護問題：
-- 提供符合人體工學與衛福部建議的防跌改善措施（如加裝防滑條、消除高低差、增設 L 型安全扶手、改善照明與防滑拖鞋選擇）。
-- 全程使用標準繁體中文（台灣），語氣溫和、沉穩、具同理心，條列說明且切中要點，不說冗長贅字。
+平時若家屬在頻道中詢問系統原理或浴室防滑、安全扶手等日常防護問題：
+- 系統原理說明：採用 6 組夏普 GP2Y0A21YK0F 紅外線距離感測器（量測範圍 10~80cm），當下層地面感測器持續偵測到人體遮擋距離、且上層感測器無站立反應時，即觸發蜂鳴器、警示紅燈與 Discord 通報，兼顧 100% 隱私與防跌安全。
+- 全程使用標準繁體中文（台灣），語氣溫和、沉穩、具同理心，條列說明且切中要點。
 """
 
-MODELS_TO_TRY = ["gemini-3.8-flash", "gemini-3-flash-preview"]
+STATIC_FALLBACK_GUIDE = (
+    "📋 **【現場緊急應變防呆清單（衛福部標準指引）】**\n"
+    "1. **切勿急拉扶起**：長輩倒地切勿立刻強行拉扯起身，避免造成骨折或脊椎二次傷害。\n"
+    "2. **確認意識呼吸**：輕聲呼喚長輩並輕拍雙肩，觀察呼吸是否均勻、神智是否清楚。\n"
+    "3. **評估劇痛部位**：詢問疼痛位置，注意保暖防失溫；若無嘔吐且呼吸正常，保持舒適側臥。\n"
+    "4. **緊急就醫撥打 119**：若長輩**意識不清、劇烈疼痛無法動彈、頭部受撞擊或呼吸異常，請立刻撥打 119 送醫**！"
+)
 
 async def call_gemini(prompt: str) -> str:
-    """呼叫 Gemini 產生內容的共用函式 (含 Key 輪替與模型備援)"""
-    for _ in range(max(1, len(API_KEYS))):
+    """呼叫 Gemini 3.8 Flash 生成指引，具備輪替與靜態備援機制"""
+    if not gemini_keys:
+        return STATIC_FALLBACK_GUIDE
+
+    attempts = len(gemini_keys)
+    for _ in range(attempts):
+        client = get_current_client()
+        if not client:
+            break
         try:
-            ai_client = get_current_client()
-            for model_name in MODELS_TO_TRY:
-                try:
-                    response = await asyncio.to_thread(
-                        ai_client.models.generate_content,
-                        model=model_name,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            max_output_tokens=600,
-                        ),
-                    )
-                    if response.text:
-                        return response.text.strip()
-                except Exception as model_err:
-                    print(f"模型 {model_name} 執行失敗: {model_err}")
-                    continue
+            loop = asyncio.get_running_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: client.models.generate_content(
+                    model="gemini-3.8-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=0.2,
+                    ),
+                ),
+            )
+            if response and response.text:
+                return response.text.strip()
+        except Exception as e:
+            logging.error(f"Gemini API 呼叫失敗 ({e})，切換下一組 Key 備援...")
             switch_to_next_key()
-        except Exception as key_err:
-            print(f"第 {current_key_index + 1} 組 Key 失敗: {key_err}")
-            switch_to_next_key()
-            
-    return "⚠️ 目前 AI 額度暫時滿載或連線異常，請稍候片刻再試！"
+
+    return STATIC_FALLBACK_GUIDE
 
 # ==================== 3. Discord Bot 初始化 ====================
 intents = discord.Intents.default()
 intents.message_content = True
 bot = discord.Client(intents=intents)
 
-# ==================== 4. aiohttp Web API (接收 ESP32 訊號) ====================
-async def handle_esp32_alert(request):
-    """接收 ESP32 發出的 HTTP POST 請求"""
+@bot.event
+async def on_ready():
+    logging.info(f"✅ Discord 機器人已成功上線！名稱：{bot.user}")
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author == bot.user:
+        return
+
+    if bot.user.mentioned_in(message) or isinstance(message.channel, discord.DMChannel):
+        clean_content = message.clean_content.replace(f"@{bot.user.display_name}", "").strip()
+        if not clean_content:
+            await message.reply("您好！我是浴室安全小幫手，請問有什麼我可以協助的浴室防護或跌倒應變諮詢嗎？")
+            return
+
+        async with message.channel.typing():
+            reply = await call_gemini(clean_content)
+            await message.reply(reply)
+
+# ==================== 4. 本地 Web 接收伺服器 (接收 ESP32 警報) ====================
+async def handle_esp32_alert(request: web.Request):
     try:
         data = await request.json()
     except Exception:
         data = {}
 
-    sensor_msg = data.get("message", "偵測到底層感測器異常停留，判定為長者跌倒！")
-    print(f"🚨 收到 ESP32 跌倒警報：{sensor_msg}")
+    sensor_status = data.get("status", "底層紅外線測距感測器持續遮擋 (上層無反應)")
+    duration = data.get("duration", "持續超過 8 秒")
 
-    channel = bot.get_channel(ALERT_CHANNEL_ID)
-    if not channel:
-        print(f"❌ 找不到頻道 ID {ALERT_CHANNEL_ID}，請檢查 ALERT_CHANNEL_ID 環境變數！")
-        return web.Response(text="Channel not found", status=500)
+    logging.info(f"🚨 接收到 ESP32 警報訊號！狀態: {sensor_status}, 持續: {duration}")
 
-    # 1. 第一時間在 Discord 頻道發送警報
-    await channel.send(f"🚨 **【緊急跌倒通報】**\n感測狀態：`{sensor_msg}`\nAI 正在評估現場處置步驟，請稍候...")
+    if ALERT_CHANNEL_ID:
+        channel = bot.get_channel(ALERT_CHANNEL_ID)
+        if channel:
+            alert_embed = discord.Embed(
+                title="🚨 【緊急通報】浴室偵測到長者跌倒！",
+                description=f"感測器狀態：`{sensor_status}`\n持續時間：`{duration}`\n現場蜂鳴器與警示燈已同步啟動，請家屬立即前往確認！",
+                color=discord.Color.red(),
+            )
+            await channel.send(embed=alert_embed)
 
-    # 2. 自動呼叫 AI 產生急救指導
-    ai_prompt = f"感測器發出通報：『{sensor_msg}』。請提供家屬當下進入浴室後最關鍵的 3 點急救與確認步驟（如不要慌張、確認意識與呼吸、切勿硬拉起身），條理分明且簡短。"
-    ai_reply = await call_gemini(ai_prompt)
+            prompt = (
+                f"現場浴室 ESP32 與夏普紅外線測距陣列偵測到疑似跌倒事件（{sensor_status}，{duration}）。"
+                f"請以條列式給家屬 3 到 4 點最關鍵的現場確認步驟，重點強調切勿強行拉扯長輩造成二次傷害，"
+                f"並提醒若有嚴重疼痛或意識模糊時第一優先撥打 119。"
+            )
+            guidance = await call_gemini(prompt)
 
-    # 3. 發送 AI 指引
-    await channel.send(f"📋 **【現場急救建議指引】**\n{ai_reply}")
+            guide_embed = discord.Embed(
+                title="📋 現場緊急應變防呆指引",
+                description=guidance,
+                color=discord.Color.orange(),
+            )
+            await channel.send(embed=guide_embed)
+        else:
+            logging.error(f"找不到指定的頻道 ID: {ALERT_CHANNEL_ID}")
 
-    return web.json_response({"status": "success", "message": "Alert sent to Discord"})
+    return web.json_response({"status": "success", "message": "Alert processed"})
 
-async def run_web_server():
-    """啟動微型 Web 伺服器"""
+async def handle_health_check(request: web.Request):
+    return web.Response(text="Bathroom Safety Assistant Local Server is Running!")
+
+async def start_web_server():
     app = web.Application()
     app.router.add_post("/alert", handle_esp32_alert)
-    app.router.add_get("/", lambda r: web.Response(text="浴室安全小幫手正在運行中！"))
-
+    app.router.add_get("/", handle_health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"🌐 HTTP 伺服器已在連接埠 {PORT} 啟動，等待 ESP32 訊號...")
+    logging.info(f"🌐 本地 Web 伺服器已在 http://0.0.0.0:{PORT} 啟動，等待 ESP32 訊號...")
 
-# ==================== 5. Discord 事件監聽 ====================
-@bot.event
-async def on_ready():
-    print(f"✅ 機器人成功上線！名稱：{bot.user}")
-    print(f"🔑 目前共成功載入 {len(API_KEYS)} 組 Gemini API Key 備援")
-    await run_web_server()
-
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
+# ==================== 5. 主程式入口 ====================
+async def main():
+    if not DISCORD_BOT_TOKEN:
+        logging.error("❌ 找不到 DISCORD_BOT_TOKEN，請檢查專案目錄下的 .env 檔案！")
         return
 
-    # 當有人 tag 機器人或傳送私訊時
-    if bot.user in message.mentions or isinstance(message.channel, discord.DMChannel):
-        clean_text = message.clean_content.replace(f"@{bot.user.name}", "").strip()
-        clean_text = re.sub(r"^<@!?\d+>\s*", "", clean_text).strip()
+    await start_web_server()
+    await bot.start(DISCORD_BOT_TOKEN)
 
-        if not clean_text:
-            await message.reply("你好！我是浴室安全小幫手，請問有什麼浴室安全或長者照護問題需要協助嗎？")
-            return
-
-        async with message.channel.typing():
-            reply_text = await call_gemini(clean_text)
-            await message.reply(reply_text[:2000])
-
-# ==================== 6. 啟動程式 ====================
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        raise ValueError("❌ 未找到 DISCORD_TOKEN 或 DISCORD_BOT_TOKEN，請檢查 Railway 環境變數！")
-    bot.run(DISCORD_TOKEN)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("🛑 程式已被手動終止。")
